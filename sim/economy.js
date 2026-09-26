@@ -1,0 +1,170 @@
+import { BALANCE } from './balance.js';
+import { eraById } from './data/eras.js';
+import { clamp } from './util.js';
+import { activeModels, safetyUnits, servingCost, PRICE_STANCE, REVENUE_PER_USER } from './serving.js';
+import { controlUnits } from './internal.js';
+import { monthlyBills, arrivingBills, creditOffset, addPipeline } from './contracts.js';
+import { leaseBills } from './power.js';
+import { resaleCredit, safetyValue, spotCover } from './split.js';
+
+export const STATE_PREEMPTION_LEGAL_COST_MULTIPLIER = 0.7;
+
+export { activeModels } from './serving.js';
+
+export const safetySpend = (state) => safetyValue(state);
+
+export const revenuePerUser = (model) => REVENUE_PER_USER[model.channel] * PRICE_STANCE[model.priceStance].rev * (model.revenueMult ?? 1);
+
+export function updateServing(state) {
+  const online = state.compute.online;
+  const control = Math.min(online, controlUnits(state));
+  const safety = safetyUnits(online, control, state.compute.split.safety);
+  const capacity = Math.max(0.001, online - control - safety);
+  const models = activeModels(state);
+  const unitsAt = (load) =>
+    models.reduce((s, m) => {
+      m.servingCost = servingCost(m.spec, state.era, load);
+      return s + (m.users * m.servingCost) / BALANCE.unitMonthlyDollars;
+    }, 0);
+  const light = unitsAt(0);
+  const load = light / capacity;
+  const units = (load > 0.8 ? unitsAt(load) : light)
+    * (state.compute.surge?.mult ?? 1)
+    * (state.compute.surge?.usage ?? 1);
+  state.compute.servingUnits = units;
+  return units;
+}
+
+export function growUsers(state, fraction = 1, { round = true } = {}) {
+  const months = eraById(state.era).monthsPerTurn;
+  for (const m of activeModels(state)) {
+    const g = (0.12 * PRICE_STANCE[m.priceStance].growth + (state.growthBoost ?? 0)) * (months / 3);
+    const grown = Math.min(m.userCap, m.users * (1 + g) ** fraction);
+    m.users = round ? Math.round(grown) : grown;
+  }
+}
+
+export function monthlyRevenue(state) {
+  return (activeModels(state).reduce((s, m) => s + m.users * revenuePerUser(m), 0) / 1e6)
+    * (state.compute.surge?.usage ?? 1);
+}
+
+export const computeRent = (state) => monthlyBills(state) + leaseBills(state) - creditOffset(state);
+
+export function projectBurn(state) {
+  const spot = spotCover(state);
+  const ops = BALANCE.baseOpsMonthly * (1 + 0.25 * (state.era - 1));
+  const arrivingRent = arrivingBills(state);
+  return ops + computeRent(state) + arrivingRent + spot + state.budget.spend - resaleCredit(state);
+}
+
+export function valuationOf(state) {
+  const base = Math.max(state.arr, 80);
+  const multiple = base < 500 ? 60 : Math.max(15, 60 - 10 * Math.log2(base / 500));
+  return base * multiple * state.sentiment;
+}
+
+// Daily: cash, ARR and valuation for `months` of story time.
+export function accrueEconomy(state, months) {
+  const burn = projectBurn(state);
+  state.burnPlanned = burn;
+  const revenue = monthlyRevenue(state);
+  state.arr = revenue * 12;
+  state.cash += (revenue - burn) * months;
+  state.valuation = valuationOf(state);
+}
+
+// Round mark: the trailing-burn history the runway readout uses.
+export function recordBurn(state) {
+  state.burnHistory.push(state.burnPlanned);
+  const recent = state.burnHistory.slice(-3);
+  state.burnTrailing = recent.reduce((a, b) => a + b, 0) / recent.length;
+}
+
+export function applyEconomy(state) {
+  accrueEconomy(state, eraById(state.era).monthsPerTurn);
+  recordBurn(state);
+}
+
+export function runway(state, which) {
+  const burn = which === 'trailing' ? state.burnTrailing : state.burnPlanned;
+  const net = burn - state.arr / 12;
+  return net <= 0 ? Infinity : state.cash / net;
+}
+
+export function legalTick(state) {
+  const multiplier = state.flags.statePreemption === true ? STATE_PREEMPTION_LEGAL_COST_MULTIPLIER : 1;
+  const paid = state.legalCases
+    .filter((c) => c.dueTurn <= state.turn)
+    .map((c) => ({ ...c, cost: c.cost * multiplier }));
+  state.legalCases = state.legalCases.filter((c) => c.dueTurn > state.turn);
+  for (const c of paid) {
+    state.cash -= c.cost;
+    state.publicTrust -= 3;
+  }
+  return paid;
+}
+
+export const INVESTORS = {
+  vc: { name: 'Growth fund', share: 0.05 },
+  strategic: { name: 'Strategic cloud partner', share: 0.06 },
+  sovereign: { name: 'Sovereign wealth fund', share: 0.15 },
+};
+
+export function raiseRound(state, archetype) {
+  if (state.era < 2) return { ok: false, error: 'funding rounds open in era 2' };
+  if (!Object.hasOwn(INVESTORS, archetype)) return { ok: false, error: `unknown investor ${archetype}` };
+  const inv = INVESTORS[archetype];
+  if (state.flags.lastRoundEra === state.era) return { ok: false, error: 'already raised a round this era' };
+  const amount = Math.round(state.valuation * inv.share);
+  state.cash += amount;
+  state.flags.lastRoundEra = state.era;
+  state.board = state.board.map((s) => s - 3);
+  if (archetype === 'vc') state.board[0] += 8;
+  if (archetype === 'strategic') {
+    state.flags.strategicStrings = true;
+  }
+  if (archetype === 'sovereign') {
+    state.govFavor.us -= 5;
+    state.publicTrust -= 4;
+    state.staffTrust -= 3;
+  }
+  return { ok: true, amount };
+}
+
+export const inDangerZone = (state) => state.cash <= 0 || runway(state, 'planned') < BALANCE.dangerZoneRunwayMonths;
+
+// Real-world models: docs/research/runway-history/runway_history.md
+export const EMERGENCY_OPTIONS = {
+  equityForCompute: 'Trade equity for compute: cash and cheap capacity now, less independence later.',
+  structureChange: 'Change your corporate structure: a big raise with a deadline attached.',
+  bridgeRound: 'Bridge round with forgiven debt: survive, at a lower valuation.',
+  acquihire: 'Accept an acquihire: a tech giant licenses your models and hires your team. The run ends.',
+};
+
+export function useEmergency(state, option) {
+  if (!Object.hasOwn(EMERGENCY_OPTIONS, option)) return { ok: false, error: `unknown option ${option}` };
+  if (!inDangerZone(state)) return { ok: false, error: 'emergency options open only when runway is short' };
+  const used = (state.flags.emergencyUsed ??= []);
+  if (used.includes(option)) return { ok: false, error: 'already used' };
+  used.push(option);
+  if (option !== 'acquihire') state.flags.emergencyUsedThisTurn = true;
+  if (option === 'equityForCompute') {
+    state.cash += 300;
+    addPipeline(state, { supplier: 'rescue', units: 10, price: 0.5, termMonths: 24, arrivesTurn: state.turn + 1, string: 'moneyBack', needsPower: false });
+    state.board = state.board.map((s) => s - 8);
+    state.flags.independenceLost = true;
+  }
+  if (option === 'structureChange') {
+    state.cash += Math.round(state.valuation * 0.2);
+    state.flags.conversionDeadline = state.turn + 8;
+    state.publicTrust -= 3;
+    state.staffTrust -= 5;
+  }
+  if (option === 'bridgeRound') {
+    state.cash += 150;
+    state.sentiment = clamp(state.sentiment - 0.2, 0.5, 1.5);
+  }
+  if (option === 'acquihire') state.ending = 'acquihire';
+  return { ok: true, option };
+}

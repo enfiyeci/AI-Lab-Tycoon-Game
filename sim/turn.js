@@ -1,0 +1,443 @@
+import { BALANCE } from './balance.js';
+import { eraById } from './data/eras.js';
+import { clamp } from './util.js';
+import { startRun, advanceRun, advanceRunBy, recheckCapacity } from './training.js';
+import { activateReleases, releaseModel } from './release.js';
+import {
+  signOffer, contractAction, deliverDue, contractsTurn, expireContracts, pullBumped, spendCredits, generateOffers, monthlyBills, sideRng,
+} from './contracts.js';
+import { placeOrder, withdrawOrder, queueTurn } from './queue.js';
+import { buildSite, leaseBills, powerTurn } from './power.js';
+import {
+  updateServing, growUsers, applyEconomy, accrueEconomy, recordBurn, legalTick, projectBurn, raiseRound, useEmergency, safetySpend,
+} from './economy.js';
+import { researchTechnique } from './techniques.js';
+import { rivalsTurn } from './rivals.js';
+import { updateBoard } from './board.js';
+import { checkTurnEndings, eraGate, finalEnding } from './endings.js';
+import { recordAdvisors } from './advisors.js';
+import { resolveHazard, exposeConcealed, INTERPRETABILITY_SPEND } from './hazards.js';
+import { deployInternal, stopInternal, internalTick } from './internal.js';
+import { addressWarning, resolveEvent, eventsTick, fallbackChoice, pushFeed, resolveDue, stampNewCards } from './events.js';
+import { CASES } from './data/constitution.js';
+import { setConstitution, amendConstitution } from './constitution.js';
+import {
+  proposeSummit,
+  holdOrShip,
+  holdOrShipError,
+  SUMMIT_SKIP_RACE_HEAT,
+  SUMMIT_SKIP_US_FAVOR,
+  SUMMIT_SKIP_INTL_FAVOR,
+} from './summit.js';
+import { expireMeeting, meetingDue, openMeeting, runMeeting } from './president.js';
+import { judgeEndingPromises, promiseUpkeep } from './promises.js';
+import { applySplitEffects, makePledge, setComputeSplit, spotCover } from './split.js';
+import { ROUND_DAYS, monthsPerDay } from './time.js';
+import { TEAM_OF, teamBusyError } from './teams.js';
+import { feedPosts } from './feed.js';
+
+export const MAX_MOVES = 2;
+const BUDGET_KEYS = ['training', 'security', 'product', 'talent'];
+// sideRng salts in sim/: 0 initial offers, 1 deals, 2 site opposition, 3 contracts, 4 queue,
+// 5 offers, 6 deliveries, 7 pooling, and 1000 + site ID for builds.
+const SITE_RNG_SALT_BASE = 1000;
+
+export function setBudget(state, budget) {
+  if (budget?.split && Object.hasOwn(budget.split, 'safety')) return { ok: false, error: 'the budget split has no safety slice: safety now runs on compute' };
+  if (budget?.split && (typeof budget.split === 'object' || typeof budget.split === 'function')) {
+    const unknown = Reflect.ownKeys(budget.split).find((key) => !BUDGET_KEYS.includes(key));
+    if (unknown !== undefined) return { ok: false, error: `unknown budget split key ${String(unknown)}` };
+  }
+  const spend = budget?.spend;
+  if (!Number.isFinite(spend) || spend < 0 || spend > 200) return { ok: false, error: 'spend must be between 0 and 200 $M per month' };
+  const values = BUDGET_KEYS.map((k) => budget?.split?.[k]);
+  if (values.some((value) => !Number.isFinite(value) || value < 0)) {
+    return { ok: false, error: 'budget split values must be finite and non-negative' };
+  }
+  const total = values.reduce((sum, value) => sum + value, 0);
+  if (Math.abs(total - 1) > 0.001) return { ok: false, error: 'the budget split must add up to 100%' };
+  state.budget = { spend, split: Object.fromEntries(BUDGET_KEYS.map((k, i) => [k, values[i]])) };
+  return { ok: true };
+}
+
+function applyMove(state, move, rng) {
+  switch (move.type) {
+    case 'startRun': return startRun(state, move.recipe);
+    case 'release': return releaseModel(state, move.release, rng);
+    case 'deal': return signOffer(state, move.offerId, sideRng(state, 1));
+    case 'queueOrder': return placeOrder(state, move);
+    case 'buildSite': return buildSite(state, move.source, sideRng(state, SITE_RNG_SALT_BASE + state.power.nextId));
+    case 'raise': return raiseRound(state, move.archetype);
+    case 'research': return researchTechnique(state, move.techId);
+    case 'emergency': return useEmergency(state, move.option);
+    case 'deployInternal': return deployInternal(state, move.control);
+    case 'stopInternal': return stopInternal(state);
+    case 'amendConstitution': return amendConstitution(state, move.change);
+    case 'summit': return proposeSummit(state, move, rng);
+    default: return { ok: false, error: `unknown move ${move.type}` };
+  }
+}
+
+// Discretionary spend buys points each turn: $30M/month for a quarter ≈ 3 points.
+function budgetEffects(state, fraction = 1) {
+  const { spend, split } = state.budget;
+  const k = (spend * eraById(state.era).monthsPerTurn) / 30;
+  if (state.activeRun) state.activeRun.bonus += split.training * k * fraction;
+  state.security += (split.security * k - 0.5) * fraction;
+  state.growthBoost = split.product * k * 0.02;
+  state.researchPoints += split.talent * k * 3 * fraction;
+  state.staffTrust += (split.talent * k * 0.3 - 0.3) * fraction;
+  if (safetySpend(state) >= INTERPRETABILITY_SPEND) exposeConcealed(state, 1 - 0.9 ** fraction);
+}
+
+function normalize(state) {
+  for (const key of ['alignmentDebt', 'concealedDebt', 'misuseExposure', 'misuseLocked', 'security', 'raceHeat', 'publicTrust', 'staffTrust']) {
+    state[key] = clamp(state[key], 0, 100);
+  }
+  state.perceivedAdOffset = clamp(state.perceivedAdOffset, 0, 100);
+  state.govFavor.us = clamp(state.govFavor.us, 0, 100);
+  state.govFavor.intl = clamp(state.govFavor.intl, 0, 100);
+}
+
+// Feed reactions to what just happened. Ambient filler only at a round mark, so quiet days stay quiet.
+// Reception, mood and ambient posts are time-based, so they run only at a round mark.
+function postFeed(before, state, events, atMark) {
+  for (const post of feedPosts(before, state, events, { ambient: atMark, timeBased: atMark })) pushFeed(state, post.handle, post.text, post.tag);
+}
+
+function finishEnding(state, events) {
+  judgeEndingPromises(state);
+  state.pendingEvents = []; // nothing can be answered once the run is over
+  for (const [id, warning] of Object.entries(state.warnings)) {
+    if (warning.eventId === 'promiseCall') delete state.warnings[id];
+  }
+  events.push({ type: 'ending', ending: state.ending });
+}
+
+function setDefaultConstitution(state) {
+  setConstitution(state, {
+    hardLines: ['no-wmd', 'honest', 'accept-shutdown'],
+    rulings: Object.fromEntries(CASES.map((entry) => [entry.id, entry.options[0].id])),
+  });
+}
+
+export function applyActions(prev, actions = {}, rng, { ignoreTeams = false } = {}) {
+  const state = structuredClone(prev);
+  const mood = { raceHeat: prev.raceHeat, publicTrust: prev.publicTrust };
+  const events = [];
+  const errors = [];
+  if (state.ending) return { state, events, errors: ['the run is over'] };
+  if (state.turn === 0) {
+    if (actions.constitution) {
+      const result = setConstitution(state, actions.constitution);
+      if (!result.ok) errors.push(result.error);
+    }
+  } else if (actions.constitution) errors.push('the constitution can only be set on turn 0');
+  if (actions.budget) {
+    const r = setBudget(state, actions.budget);
+    if (!r.ok) errors.push(r.error);
+  }
+  if (Object.hasOwn(actions, 'computeSplit')) {
+    const r = setComputeSplit(state, actions.computeSplit);
+    if (!r.ok) errors.push(r.error);
+  }
+  if (actions.pledge != null) {
+    const r = makePledge(state, actions.pledge);
+    if (!r.ok) errors.push(r.error);
+  }
+  for (const a of actions.contractActions ?? []) {
+    const r = contractAction(state, a);
+    if (!r.ok) errors.push(r.error);
+  }
+  if (Object.hasOwn(actions, 'queueWithdraw')) {
+    if (typeof actions.queueWithdraw !== 'boolean') errors.push('queueWithdraw must be true or false');
+    else if (actions.queueWithdraw) {
+      const r = withdrawOrder(state);
+      if (!r.ok) errors.push(r.error);
+    }
+  }
+  if (actions.contractActions?.length) {
+    updateServing(state);
+    state.burnPlanned = projectBurn(state);
+  }
+  if (actions.hazardChoice && state.pendingModel?.hazard) {
+    const r = resolveHazard(state, actions.hazardChoice);
+    if (!r.ok) errors.push(r.error);
+    else events.push({ type: 'hazardResolved', choice: actions.hazardChoice });
+  }
+  for (const id of actions.addressWarnings ?? []) {
+    const result = addressWarning(state, id);
+    if (!result.ok) errors.push(result.error);
+  }
+  const eventChoices = actions.eventChoices ?? {};
+  const handledChoices = new Set();
+  for (const pending of [...state.pendingEvents]) {
+    const { id } = pending;
+    const choiceKey = Object.hasOwn(eventChoices, id) ? id : null;
+    if (!choiceKey) continue;
+    const choiceId = eventChoices[choiceKey];
+    const result = resolveEvent(state, id, choiceId);
+    if (!result.ok) errors.push(result.error);
+    handledChoices.add(choiceKey);
+  }
+  for (const id of Object.keys(eventChoices)) {
+    if (handledChoices.has(id)) continue;
+    const result = resolveEvent(state, id, eventChoices[id]);
+    if (!result.ok) errors.push(result.error);
+  }
+  if (Object.hasOwn(actions, 'holdOrShip') && actions.holdOrShip !== undefined) {
+    const error = holdOrShipError(actions.holdOrShip);
+    if (error) errors.push(error);
+    else state.holdOrShipChoice = actions.holdOrShip;
+  }
+
+  activateReleases(state);
+  updateServing(state);
+  state.burnPlanned = projectBurn(state);
+
+  for (const move of actions.moves ?? []) {
+    if (state.round.moves >= MAX_MOVES) {
+      errors.push(`only ${MAX_MOVES} actions per round`);
+      break;
+    }
+    const busy = ignoreTeams ? null : teamBusyError(state, move);
+    if (busy) {
+      errors.push(busy);
+      continue;
+    }
+    if (move.type === 'meeting') {
+      if (!state.meeting) {
+        errors.push('no open President meeting');
+        continue;
+      }
+      const id = state.meeting.id;
+      const answerIds = Object.hasOwn(actions, 'presidentAnswers') ? actions.presidentAnswers : undefined;
+      const result = runMeeting(state, answerIds);
+      if (!result.ok) errors.push(result.error);
+      const outcome = result.ok ? result.outcome : expireMeeting(state).outcome;
+      events.push({ type: 'meetingOutcome', id, walkedOut: outcome.walkedOut, stake: outcome.stake });
+      updateServing(state);
+      state.burnPlanned = projectBurn(state);
+      if (result.ok) {
+        state.round.moves += 1;
+        const team = TEAM_OF[move.type];
+        if (team) state.round.teams[team] = move.type;
+      }
+      continue;
+    }
+    if (move.type === 'amendConstitution' && state.turn === 0 && state.constitution.hardLines.length === 0) {
+      setDefaultConstitution(state);
+    }
+    const r = applyMove(state, move, rng);
+    if (r.ok) {
+      if (move.type === 'release') r.model.releasedDay = state.day;
+      if (move.type === 'summit') events.push({ type: 'summit', signed: r.signed, binding: r.binding });
+      else events.push({ type: move.type, ...r });
+      if (r.hazardIgnored) events.push({ type: 'hazardResolved', choice: 'ignore', auto: true });
+      updateServing(state);
+      state.burnPlanned = projectBurn(state);
+      state.round.moves += 1;
+      const team = TEAM_OF[move.type];
+      if (team) state.round.teams[team] = move.type;
+    } else errors.push(r.error);
+    if (state.ending) break;
+  }
+
+  activateReleases(state);
+  updateServing(state);
+  state.burnPlanned = projectBurn(state);
+  if (state.ending) {
+    normalize(state);
+    recordAdvisors(state, rng);
+    finishEnding(state, events);
+  }
+  const announced = events.filter((event) => event.type !== 'release' || event.model?.activated);
+  if (announced.length) postFeed(mood, state, announced, false);
+  recheckCapacity(state);
+  return { state, events, errors };
+}
+
+function endRound(state, rng, observer, events, errors, trainingFraction = 0) {
+  const meetingIdAtStart = state.meeting?.id ?? null;
+  if (!meetingIdAtStart) {
+    const id = meetingDue(state);
+    if (id) {
+      state.meeting = openMeeting(state, id);
+      events.push({ type: 'meetingDue', id });
+    }
+  }
+  if (state.turn === 0 && state.constitution.hardLines.length === 0) {
+    setDefaultConstitution(state);
+  }
+
+  if (meetingIdAtStart && state.meeting) {
+    errors.push('take the President meeting with a meeting move');
+    const outcome = expireMeeting(state).outcome;
+    events.push({ type: 'meetingOutcome', id: meetingIdAtStart, walkedOut: outcome.walkedOut, stake: outcome.stake });
+  }
+
+  if (state.era === 5 && state.deal && state.turnInEra > 0) {
+    for (const event of holdOrShip(state, state.holdOrShipChoice, rng)) events.push(event);
+  }
+
+  if (!state.ending) {
+    for (const e of applySplitEffects(state)) {
+      events.push(e);
+      if (e.type === 'outage') pushFeed(state, '@downdetector', 'users report outages across your apps', 'feed');
+    }
+    for (const e of internalTick(state, rng)) events.push(e);
+    if (!state.ending) {
+      if (trainingFraction > 0) {
+        const trained = advanceRunBy(state, rng, trainingFraction);
+        if (trained?.type === 'runPaused') events.push(trained);
+        else if (trained) events.push({ type: 'runComplete', gain: trained.gain });
+      }
+      const c = contractsTurn(state, sideRng(state, 3));
+      if (c.warnedBump) {
+        events.push({ type: 'spotWarning' });
+        pushFeed(state, '@marketwire', 'spot GPU capacity is being pulled for prepaid customers', 'warning');
+      }
+      for (const e of queueTurn(state, sideRng(state, 4))) {
+        events.push(e);
+        if (e.type === 'rivalPrepays') pushFeed(state, '@marketwire', `${state.rivals.find((r) => r.id === e.lab).name} prepays Verde for priority`, 'feed');
+      }
+      growUsers(state, 0);
+      updateServing(state);
+      observer.beforeEconomy?.({
+        era: state.era,
+        burn: projectBurn(state),
+        compute: monthlyBills(state) + leaseBills(state) + spotCover(state),
+      });
+      recordBurn(state);
+      if (state.compute.surge && --state.compute.surge.turnsLeft <= 0) {
+        state.compute.split.coverWithSpot = state.compute.surge.restoreCover ?? state.compute.split.coverWithSpot;
+        state.compute.surge = null;
+      }
+      spendCredits(state);
+      for (const x of expireContracts(state)) events.push({ type: 'contractEnded', supplier: x.supplier, units: x.units });
+      for (const x of pullBumped(state)) events.push({ type: 'spotPulled', units: x.units });
+      if (state.flags.conversionDeadline != null && state.turn >= state.flags.conversionDeadline && !state.flags.converted) {
+        state.flags.converted = true;
+        state.board = state.board.map((support) => support - 6);
+        state.publicTrust -= 4;
+        state.staffTrust -= 6;
+        events.push({ type: 'conversionFight' });
+      }
+      for (const c of legalTick(state)) events.push({ type: 'lawsuitPaid', cost: c.cost, source: c.source });
+      state.lastRivalReleases = rivalsTurn(state, rng);
+      for (const r of state.lastRivalReleases) events.push({ type: 'rivalRelease', ...r });
+      state.raceHeat -= BALANCE.raceHeatDecay;
+      promiseUpkeep(state, rng);
+      for (const e of eventsTick(state, rng)) events.push(e);
+      normalize(state);
+      updateBoard(state, state.roundStart);
+      checkTurnEndings(state, rng);
+    }
+  }
+
+  if (!state.ending && state.era === 5 && state.turnInEra === 0 && !state.deal) {
+    state.raceHeat += SUMMIT_SKIP_RACE_HEAT;
+    state.govFavor.us -= SUMMIT_SKIP_US_FAVOR;
+    state.govFavor.intl -= SUMMIT_SKIP_INTL_FAVOR;
+    events.push({ type: 'summitSkipped' });
+  }
+
+  normalize(state);
+  state.concealedDebt = Number(state.concealedDebt.toFixed(12));
+  state.alignmentDebt = Number(state.alignmentDebt.toFixed(12));
+  recordAdvisors(state, rng);
+  const era = eraById(state.era);
+  state.turn += 1;
+  state.turnInEra += 1;
+  state.monthsElapsed += era.monthsPerTurn;
+  if (!state.ending && state.turnInEra >= era.turns) {
+    eraGate(state);
+    if (!state.ending) {
+      if (state.era === 5) {
+        if (state.flags.insolvent && state.cash <= 0) state.ending = 'acquihire';
+        else finalEnding(state);
+      }
+      else {
+        state.era += 1;
+        state.turnInEra = 0;
+        events.push({ type: 'eraStart', era: state.era });
+      }
+    }
+  }
+  if (!state.ending) {
+    for (const e of powerTurn(state)) events.push(e);
+    for (const x of deliverDue(state, sideRng(state, 6))) events.push({ type: 'computeArrived', supplier: x.supplier, units: x.units });
+    state.compute.offers = generateOffers(state, sideRng(state, 5));
+    // A delayed release goes live at the round mark, action or not (the old turn did this first thing next turn).
+    const waiting = state.models.filter((model) => model.active && !model.activated);
+    activateReleases(state);
+    for (const model of waiting) if (model.activated && model.active) events.push({ type: 'modelLive', model });
+    updateServing(state);
+    state.burnPlanned = projectBurn(state);
+  }
+  state.dayInRound = 0;
+  state.round = { moves: 0, teams: {} };
+  delete state.flags.emergencyUsedThisTurn;
+  state.roundStart = { arr: state.arr, capability: state.capability, cash: state.cash, raceHeat: state.raceHeat, publicTrust: state.publicTrust };
+  if (!state.ending) stampNewCards(state, rng);
+  // A card made on the final mark can never be seen or answered.
+  else state.pendingEvents = state.pendingEvents.filter((card) => card.landsAt != null);
+  if (state.ending) {
+    finishEnding(state, events);
+  }
+}
+
+function postLandedCards(state) {
+  for (const card of state.pendingEvents) {
+    if (card.posted || card.landsAt == null || card.landsAt > state.day) continue;
+    if (!card.post) {
+      card.posted = true;
+      continue;
+    }
+    pushFeed(state, card.post.handle, card.post.text, 'event');
+    card.posted = true;
+  }
+}
+
+export function advanceDays(prev, days, rng, observer = {}) {
+  const state = structuredClone(prev);
+  const events = [];
+  const errors = [];
+  if (state.ending) return { state, events, errors: ['the run is over'] };
+  for (let i = 0; i < days && !state.ending; i += 1) {
+    // Mood posts compare the whole round, start to mark, as the old turn did, so an instant action's shift is not lost.
+    const mood = { raceHeat: state.roundStart.raceHeat ?? state.raceHeat, publicTrust: state.roundStart.publicTrust ?? state.publicTrust };
+    const firstEvent = events.length;
+    const fraction = 1 / ROUND_DAYS[state.era];
+    budgetEffects(state, fraction);
+    const reachesMark = state.dayInRound + 1 >= ROUND_DAYS[state.era];
+    if (!reachesMark) {
+      const trained = advanceRunBy(state, rng, fraction);
+      if (trained?.type === 'runPaused') {
+        if (state.dayInRound === 0) events.push(trained);
+      } else if (trained) events.push({ type: 'runComplete', gain: trained.gain });
+    }
+    growUsers(state, fraction, { round: false });
+    updateServing(state);
+    accrueEconomy(state, monthsPerDay(state));
+    state.day += 1;
+    state.dayInRound += 1;
+    postLandedCards(state);
+    for (const e of resolveDue(state)) events.push(e);
+    if (reachesMark) {
+      endRound(state, rng, observer, events, errors, fraction);
+      postLandedCards(state);
+    }
+    const dayEvents = events.slice(firstEvent);
+    if (reachesMark || dayEvents.length) postFeed(mood, state, dayEvents, reachesMark);
+  }
+  return { state, events, errors };
+}
+
+export function endTurn(prev, actions = {}, rng, observer = {}) {
+  const acted = applyActions(prev, actions, rng, { ignoreTeams: true });
+  if (acted.state.ending) return acted;
+  const left = ROUND_DAYS[acted.state.era] - acted.state.dayInRound;
+  const moved = advanceDays(acted.state, left, rng, observer);
+  return { state: moved.state, events: [...acted.events, ...moved.events], errors: [...acted.errors, ...moved.errors] };
+}
